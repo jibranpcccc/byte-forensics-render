@@ -1,15 +1,18 @@
 name: render-1440p
 
-# Sharded 1440p render. The episode timeline is a pure function of t, so frames
-# are independent: job k renders every Nth frame and uploads them as an artifact.
-# A final job downloads them, encodes with ffmpeg, muxes the embedded audio
-# track, and publishes the MP4.
+# Two sharded stages, because the profile says the ENCODE is the bottleneck:
 #
-# N shards -> about N times less wall time than one machine.
+#   measured on run 41192802534 (EP16, 1440p, 8 shards)
+#     render shards   174-281 s   (parallel -> wall ~280 s)
+#     assemble        801 s       of which ENCODE = 725 s
+#     whole run      1189 s       => the encode was 61% of the entire run
 #
-# The shard count comes from the `shards` input and the matrix is GENERATED from
-# it, so the runner count can never disagree with the divisor passed to --shard.
-# If they disagreed, the assembled video would silently be missing frames.
+# So encoding is split the same way rendering already is: N jobs each encode
+# their own fraction into a LOSSLESS part, then a small job concatenates the
+# parts (stream copy, no re-encode) and muxes the audio once.
+#
+# Wall time becomes (slowest render shard) + (slowest encode shard) + (fast concat)
+# instead of (slowest render shard) + (one serial 12-minute encode).
 
 on:
   workflow_dispatch:
@@ -23,9 +26,13 @@ on:
         required: true
         default: "1440p"
       shards:
-        description: "number of parallel shards"
+        description: "parallel shards for BOTH render and encode"
         required: true
-        default: "8"
+        default: "12"
+      quality:
+        description: "encode preset: veryfast (fast) or medium (slowest, tiny gain)"
+        required: true
+        default: "veryfast"
 
 jobs:
   probe:
@@ -45,8 +52,7 @@ jobs:
           m = re.search(r"const TIMING = /\*__TIMING__\*/(\{.*?\});", src, re.S)
           if not m:
               raise SystemExit("no embedded TIMING -- is the audio attached?")
-          total = json.loads(m.group(1))["total"]
-          print("frames=%d" % int(round(total * 30)))
+          print("frames=%d" % int(round(json.loads(m.group(1))["total"] * 30)))
           PY
 
       - id: m
@@ -55,8 +61,8 @@ jobs:
           python - <<'PY' >> "$GITHUB_OUTPUT"
           import json
           n = int("${{ github.event.inputs.shards }}")
-          if n < 1 or n > 32:
-              raise SystemExit("shards must be 1..32")
+          if n < 1 or n > 40:
+              raise SystemExit("shards must be 1..40")
           print("matrix=" + json.dumps({"shard": list(range(n))}))
           PY
 
@@ -68,16 +74,14 @@ jobs:
       matrix: ${{ fromJSON(needs.probe.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+        with: { python-version: "3.12" }
 
       - name: cache playwright browsers
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: pw-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
+          key: pw-${{ runner.os }}-v1
           restore-keys: pw-${{ runner.os }}-
 
       - name: install playwright
@@ -90,7 +94,8 @@ jobs:
         run: |
           python render_episode.py "${{ github.event.inputs.episode }}" \
             --preset "${{ github.event.inputs.preset }}" \
-            --shard "${{ matrix.shard }}/${{ github.event.inputs.shards }}"
+            --shard "${{ matrix.shard }}/${{ github.event.inputs.shards }}" \
+            --quality 92
 
       - uses: actions/upload-artifact@v4
         with:
@@ -98,18 +103,11 @@ jobs:
           path: _frames_*/
           retention-days: 2
 
-  assemble:
+  flatten:
     needs: [probe, render]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - uses: actions/download-artifact@v4
         with:
@@ -117,34 +115,94 @@ jobs:
           merge-multiple: true
           path: _frames_all
 
-      - name: check every shard arrived
+      - name: verify every frame arrived, then flatten
         run: |
-          # Count the JPEGs RECURSIVELY. download-artifact merges the shards into
-          # a nested directory, so a plain `ls` counts folders, not frames --
-          # which is what made this check report "1" for 17222 rendered frames.
           want=${{ needs.probe.outputs.frames }}
           have=$(find _frames_all -name 'f*.jpg' -type f | wc -l)
           echo "frames present: $have, expected: $want"
-          # where did they land?
-          find _frames_all -maxdepth 2 -type d | head -20
           if [ "$have" -ne "$want" ]; then
-            missing=$((want - have))
-            echo "::error::$missing frames missing -- a shard failed or uploaded nothing"
+            echo "::error::$((want - have)) frames missing -- a shard failed"
             exit 1
           fi
-          # flatten, so ffmpeg sees one sequence and numbering stays global
           mkdir -p _frames_flat
           find _frames_all -name 'f*.jpg' -type f -exec cp {} _frames_flat/ \;
-          echo "flattened: $(find _frames_flat -name 'f*.jpg' | wc -l) frames"
-          ls _frames_flat | head -3
-          ls _frames_flat | tail -3
+          echo "flattened $(find _frames_flat -name 'f*.jpg' | wc -l) frames"
 
-      - name: encode and mux the embedded audio
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frames-flat
+          path: _frames_flat/
+          retention-days: 2
+          compression-level: 0
+
+  encode:
+    needs: [probe, flatten]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.probe.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: frames-flat
+          path: _frames_flat
+
+      - name: install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: encode part ${{ matrix.shard }} of ${{ github.event.inputs.shards }}
         run: |
-          python render_episode.py "${{ github.event.inputs.episode }}" \
-            --preset "${{ github.event.inputs.preset }}" \
-            --outdir _frames_flat --out "RENDER_${{ github.event.inputs.preset }}.mp4" \
-            --assemble
+          python encode_episode.py "${{ github.event.inputs.episode }}" \
+            --frames _frames_flat \
+            --shards "${{ github.event.inputs.shards }}" \
+            --part "${{ matrix.shard }}" \
+            --preset "${{ github.event.inputs.quality }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: parts-${{ matrix.shard }}
+          path: _part_*.mp4
+          retention-days: 2
+
+  assemble:
+    needs: [probe, render, encode]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: parts-*
+          merge-multiple: true
+          path: _parts
+
+      - name: collect the encoded parts
+        run: |
+          n=${{ github.event.inputs.shards }}
+          mkdir -p _parts_ordered
+          for i in $(seq 0 $((n-1))); do
+            src=$(find _parts -name "_part_$(printf %02d $i).mp4" | head -1)
+            if [ -z "$src" ]; then
+              echo "::error::part $i missing"; exit 1
+            fi
+            cp "$src" "_parts_ordered/_part_$(printf %02d $i).mp4"
+          done
+          ls -la _parts_ordered
+
+      - name: concat the parts and mux the embedded audio
+        run: |
+          python encode_episode.py "${{ github.event.inputs.episode }}" \
+            --assemble --shards "${{ github.event.inputs.shards }}" \
+            --out "RENDER_${{ github.event.inputs.preset }}.mp4"
 
       - uses: actions/upload-artifact@v4
         with:
