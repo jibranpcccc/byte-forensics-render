@@ -1,0 +1,6 @@
+_frames*/
+*.mp4
+_shots/
+_*_full/
+__pycache__/
+*.bak
