@@ -181,7 +181,9 @@ def assemble_parts(html, parts, out_mp4, crf, preset):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("html")
-    ap.add_argument("--frames", default=None, help="frames dir")
+    ap.add_argument("--frames", default=None, help="frames dir (render parts)")
+    ap.add_argument("--parts", default=None,
+                    help="dir holding _part_NN.mp4 (encode parts)")
     ap.add_argument("--shards", type=int, default=8)
     ap.add_argument("--part", type=int, default=None)
     ap.add_argument("--assemble", action="store_true")
@@ -193,9 +195,22 @@ def main():
     stem = os.path.splitext(os.path.basename(a.html))[0]
     frames = a.frames or os.path.join(HERE, "_frames_%s_1440p" % stem)
     out = a.out or os.path.join(HERE, "RENDER_%s_1440p.mp4" % stem)
-    parts = [os.path.join(HERE, "_part_%02d.mp4" % i) for i in range(a.shards)]
 
     if a.assemble:
+        # The assembler must LOOK WHERE THE PARTS ACTUALLY ARE. In CI the encode
+        # jobs upload _part_NN.mp4 as artifacts and the assemble job collects them
+        # into --parts; locally they sit beside this script. Defaulting to the
+        # script directory ignored --parts entirely, so CI found nothing and
+        # exited 1 with no message.
+        part_dir = a.parts or HERE
+        parts = [os.path.join(part_dir, "_part_%02d.mp4" % i)
+                 for i in range(a.shards)]
+        missing = [p for p in parts if not os.path.exists(p)]
+        if missing:
+            print("looking for parts in: %s" % part_dir)
+            print("MISSING %d of %d: %s"
+                  % (len(missing), len(parts),
+                     ", ".join(os.path.basename(m) for m in missing[:6])))
         assemble_parts(a.html, parts, out, a.crf, a.preset)
         for p in parts:
             if os.path.exists(p):
@@ -204,7 +219,10 @@ def main():
 
     if a.part is None:
         raise SystemExit("need --part N or --assemble")
-    encode_part(frames, parts[a.part], a.part, a.shards, a.preset, a.crf)
+    partdir = a.parts or HERE
+    os.makedirs(partdir, exist_ok=True)
+    encode_part(frames, os.path.join(partdir, "_part_%02d.mp4" % a.part),
+                a.part, a.shards, a.preset, a.crf)
 
 
 if __name__ == "__main__":
