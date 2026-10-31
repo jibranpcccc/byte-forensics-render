@@ -113,24 +113,63 @@ def render(html, width, height, outdir, shard=(0, 1), quality=92, verbose=True):
 
 
 def assemble(html, outdir, out_mp4, width, height, bitrate, audio_only=False):
-    """Encode the frames, then mux the embedded audio. Audio is the clock."""
+    """Encode the frames, then mux the embedded audio. Audio is the clock.
+
+    Frames arrive from N shards, so the numbering is GAPPED: shard k produced
+    frames k, k+N, k+2N... Measured with ffmpeg's image2 demuxer: a directory of
+    f000000, f000002, f000004... is read as ONE frame, because the sequence stops
+    at the first missing number. (Verified: 10 gapped files -> nb_read_frames=1.)
+
+    So the frames are renumbered into a contiguous run before encoding. Without
+    this a 9-minute episode encodes as a single frame.
+    """
     audio = os.path.join(HERE, "_render_audio.mp3")
     ap = extract_audio(html, audio)
     total = total_seconds(html)
 
-    frames = sorted(f for f in os.listdir(outdir) if f.endswith(".jpg"))
-    if not frames:
+    found = []
+    for root, _dirs, names in os.walk(outdir):
+        for n in names:
+            if n.endswith(".jpg") and n.startswith("f"):
+                try:
+                    idx = int(n[1:7])
+                except ValueError:
+                    continue
+                found.append((idx, os.path.join(root, n)))
+    if not found:
         raise SystemExit("no frames in %s" % outdir)
-    print("assembling %d frames -> %s" % (len(frames), out_mp4))
+    found.sort()
+
+    expected = int(round(total * FPS))
+    print("assembling %d frames -> %s" % (len(found), out_mp4))
+    if len(found) != expected:
+        print("WARNING: have %d frames, expected %d (%+.0f frames)"
+              % (len(found), expected, len(found) - expected))
+
+    # renumber into a contiguous sequence so ffmpeg sees no gap
+    seqdir = os.path.join(HERE, "_frames_seq")
+    if os.path.exists(seqdir):
+        import shutil
+        shutil.rmtree(seqdir, ignore_errors=True)
+    os.makedirs(seqdir, exist_ok=True)
+    for k, (_idx, path) in enumerate(found):
+        dst = os.path.join(seqdir, "f%06d.jpg" % k)
+        try:
+            os.link(path, dst)
+        except Exception:
+            import shutil as _sh
+            _sh.copy(path, dst)
 
     silent = out_mp4.replace(".mp4", "_silent.mp4")
     cmd = ["ffmpeg", "-y", "-v", "error",
            "-framerate", str(FPS),
-           "-i", os.path.join(outdir, "f%06d.jpg"),
+           "-i", os.path.join(seqdir, "f%06d.jpg"),
            "-c:v", "libx264", "-preset", "medium", "-crf", "17",
            "-pix_fmt", "yuv420p", "-r", str(FPS),
            "-b:v", bitrate, silent]
     subprocess.run(cmd, check=True)
+    import shutil
+    shutil.rmtree(seqdir, ignore_errors=True)
 
     if ap and os.path.exists(ap):
         cmd2 = ["ffmpeg", "-y", "-v", "error", "-i", silent, "-i", ap,

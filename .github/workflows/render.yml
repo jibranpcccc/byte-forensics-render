@@ -119,19 +119,31 @@ jobs:
 
       - name: check every shard arrived
         run: |
-          have=$(ls _frames_all | wc -l)
+          # Count the JPEGs RECURSIVELY. download-artifact merges the shards into
+          # a nested directory, so a plain `ls` counts folders, not frames --
+          # which is what made this check report "1" for 17222 rendered frames.
           want=${{ needs.probe.outputs.frames }}
+          have=$(find _frames_all -name 'f*.jpg' -type f | wc -l)
           echo "frames present: $have, expected: $want"
+          # where did they land?
+          find _frames_all -maxdepth 2 -type d | head -20
           if [ "$have" -ne "$want" ]; then
-            echo "::error::frame count mismatch -- a shard failed or uploaded nothing"
+            missing=$((want - have))
+            echo "::error::$missing frames missing -- a shard failed or uploaded nothing"
             exit 1
           fi
+          # flatten, so ffmpeg sees one sequence and numbering stays global
+          mkdir -p _frames_flat
+          find _frames_all -name 'f*.jpg' -type f -exec cp {} _frames_flat/ \;
+          echo "flattened: $(find _frames_flat -name 'f*.jpg' | wc -l) frames"
+          ls _frames_flat | head -3
+          ls _frames_flat | tail -3
 
       - name: encode and mux the embedded audio
         run: |
           python render_episode.py "${{ github.event.inputs.episode }}" \
             --preset "${{ github.event.inputs.preset }}" \
-            --outdir _frames_all --out "RENDER_${{ github.event.inputs.preset }}.mp4" \
+            --outdir _frames_flat --out "RENDER_${{ github.event.inputs.preset }}.mp4" \
             --assemble
 
       - uses: actions/upload-artifact@v4
