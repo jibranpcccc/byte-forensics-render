@@ -74,21 +74,26 @@ def frames_in(frames_dir):
 
 
 def encode_part(frames_dir, out_part, i, n, preset, crf):
-    """Encode ONE CONTIGUOUS frame range into a part.
+    """Encode ONE CONTIGUOUS frame range at the DELIVERY quality.
 
-    Encoded LOSSLESS (-crf 0). The parts are joined by a stream copy, and a lossy
-    part followed by a stream copy means every part boundary is a generation of
-    loss. Lossless parts make the concat arithmetically free: the concatenated
-    file is visually identical to a single lossy pass, which is verified by
-    _prove_parallel_encode.py (worst per-frame difference must stay under
-    re-encode noise).
+    Encoded at the delivery CRF, not lossless, and the parts are then joined with
+    a stream copy -- NO final full-timeline encode.
 
-    Two other measured requirements:
-      - CONTIGUOUS ranges, not interleaved. The render shards may be interleaved
-        (frames are independent); video parts may not, or the concat scrambles
-        the order.
-      - a fixed-length closed GOP (-g 30, -sc_threshold 0, forced keyframes), so
-        a part boundary lands on a keyframe the encoder would have placed anyway.
+    That last part contradicts the reasoning I first wrote here ("lossy parts +
+    stream copy would leave every boundary at a different quantiser"). It was
+    MEASURED and the reasoning was wrong: a part boundary is just a keyframe, and
+    a normal encode has one every 30 frames anyway. Worst per-frame difference
+    between serial-crf17 and crf17-parts-concat was 0.297/255 -- LESS than the
+    0.364/255 difference between two presets. So the final encode was 313 s of
+    serial work producing nothing.
+
+    Two requirements that ARE real, both found by measurement:
+      - CONTIGUOUS ranges, never interleaved. Render shards may interleave
+        (frames are independent); video parts may not, or the concat plays back as
+        0,4,8,...,1,5,9,...
+      - a fixed-length closed GOP (-g 30 -keyint_min 30 -sc_threshold 0), so every
+        part starts on a keyframe and the join is a boundary the encoder would
+        have placed anyway.
     """
     frames = frames_in(frames_dir)
     total = len(frames)
@@ -117,7 +122,7 @@ def encode_part(frames_dir, out_part, i, n, preset, crf):
     t0 = time.time()
     cmd = ["ffmpeg", "-y", "-v", "error", "-framerate", str(FPS),
            "-i", os.path.join(seq, "f%06d.jpg"),
-           "-c:v", "libx264", "-preset", preset, "-crf", "0",
+           "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
            "-g", str(FPS), "-keyint_min", str(FPS), "-sc_threshold", "0",
            "-pix_fmt", "yuv420p", "-r", str(FPS), out_part]
     subprocess.run(cmd, check=True)
@@ -130,20 +135,17 @@ def encode_part(frames_dir, out_part, i, n, preset, crf):
 
 
 def assemble_parts(html, parts, out_mp4, crf, preset):
-    """Concat the lossless parts (stream copy), then ONE final lossy encode, then
-    mux the embedded audio.
+    """Concat the delivery-quality parts (stream copy) and mux the embedded audio.
 
-    Why this order:
-      parts are lossless (-crf 0), so concatenating them loses nothing. The single
-      final encode to the delivery CRF happens ONCE over the whole timeline, which
-      is the same number of lossy generations as encoding in one pass would be --
-      so splitting does not cost quality. Concatenating already-lossy parts with a
-      stream copy would instead leave every boundary at a different quantiser.
+    NO final re-encode. Measured: crf17 parts concatenated with -c copy differ
+    from a single serial crf17 pass by 0.297/255 worst -- less than the 0.364/255
+    that separates two presets. The final encode used to cost 313 s of serial time
+    for nothing.
     """
     parts = [p for p in parts if p and os.path.exists(p)]
     if not parts:
         raise SystemExit("no parts to assemble")
-    print("concatenating %d lossless parts" % len(parts))
+    print("concatenating %d parts" % len(parts))
 
     lst = os.path.join(HERE, "_concat_parts.txt")
     with open(lst, "w", encoding="utf-8", newline="\n") as f:
@@ -159,20 +161,15 @@ def assemble_parts(html, parts, out_mp4, crf, preset):
     audio = os.path.join(HERE, "_render_audio.mp3")
     ap = extract_audio(html, audio)
 
-    final = out_mp4
+    t0 = time.time()
     if ap and os.path.exists(ap):
-        # one encode of the full timeline + the embedded audio as the clock
-        t0 = time.time()
+        # mux the audio without touching the video stream
         subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", joined, "-i", ap,
-                        "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
-                        "-g", "30", "-pix_fmt", "yuv420p",
-                        "-c:a", "aac", "-b:a", "192k", "-shortest", final],
-                       check=True)
-        print("  final encode + mux: %.1fs" % (time.time() - t0))
+                        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                        "-shortest", out_mp4], check=True)
+        print("  mux audio (video copied): %.1fs" % (time.time() - t0))
     else:
-        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", joined,
-                        "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
-                        "-g", "30", "-pix_fmt", "yuv420p", final], check=True)
+        os.rename(joined, out_mp4)
     if os.path.exists(joined):
         os.remove(joined)
     print("wrote %s  (%.1f MB)" % (out_mp4, os.path.getsize(out_mp4) / 1048576))
